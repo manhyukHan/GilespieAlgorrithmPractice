@@ -34,7 +34,7 @@
     X = sim.getState()
 
     sim.addInit(x0=X[-1,:])     # addInit method initializes the initial value
-    sim.addPropensity(propensity_func,*args)    # add method automatically initializes
+    sim.addPropensity(propensity_func,**kwargs)    # add method automatically initializes
     
     sim.run(
         type = 'timeevolution',
@@ -53,11 +53,20 @@ import os
 import time
 import logging
 import warnings
+import dill
 import multiprocessing as mp
+
+propensityKwargs__ = dict()
+propensityFunction__ = lambda x: x
+reactionMatrix__ = np.empty((0,0))
+tspan__ = [0,0]
+MAX_OUTPUT_LENGTH__ = 0
+
 
 def init(*args):
 
     global propensityFunction__
+    global propensityKwargs__
     global reactionMatrix__
     global tspan__
     global MAX_OUTPUT_LENGTH__
@@ -65,6 +74,7 @@ def init(*args):
     reactionMatrix__ = args[1]
     tspan__ = args[2]
     MAX_OUTPUT_LENGTH__ = args[3]
+    propensityKwargs__ = args[4]
     
 
 class Simulation():
@@ -88,6 +98,7 @@ class Simulation():
         self.tspan = [0,0]
         self.propensityFunction = lambda x: np.transpose(x)
         self.reactionMatrix = np.empty((0,0))
+        init(self.propensityFunction,self.reactionMatrix,self.tspan,0,dict())
        
     def addInit(self,x0):
         """add Initial state (n-dimensional row vector) on the system.
@@ -96,18 +107,24 @@ class Simulation():
         if isinstance(x0,list):
             x0 = np.array(x0)
         
-        self.numStates = len(x0)
-        self.state = x0.reshape(1,self.numStates)
+        self.numStates = np.size(x0)
+        self.state = np.copy(x0).astype(np.float32).reshape(1,self.numStates)
         
-    def addPropensity(self, propensity_func, *args):
+    def addPropensity(self, propensity_func, **kwargs):
         """add propensity function (callable) on the system.
 
         Args:
             propensity_func (callable): generate propensity vector (numReaction x 1)
         
         """
-        self.propensityFunction = lambda x: propensity_func(x, *args)
-           
+        global propensityKwargs__
+        propensityKwargs__ = kwargs
+        
+        global propensityFunction__
+        propensityFunction__ = propensity_func
+        
+        self.propensityFunction = lambda x: propensity_func(x, **kwargs)
+        
     def addReaction(self, reaction_matrix):
         """add reaction matrix (stochi_matrix) on the system.
 
@@ -127,31 +144,70 @@ class Simulation():
         return self.timeEvolve
     
     @staticmethod
-    @numba.njit
     def _iterator(
-                initialState,
-                propensityFunction=propensityFunction__,
-                reactionMatrix=reactionMatrix__,
-                tspan=tspan__,
-                MAX_OUTPUT_LENGTH=MAX_OUTPUT_LENGTH__):
+                x,
+                ):
         """Iteration unit
         
         type/ plausibility check must be preceded
         """
+        global propensityFunction__
+        global reactionMatrix__
+        global tspan__
+        global MAX_OUTPUT_LENGTH__
+        global propensityKwargs__
+        
+        #print(propensityFunction__)
+        
+        propensityFunction = propensityFunction__
+        propensityKwargs = propensityKwargs__
+        reactionMatrix = reactionMatrix__
+        tspan = tspan__
+        MAX_OUTPUT_LENGTH = MAX_OUTPUT_LENGTH__
+        
         ## running simulation
-        numStates = len(initialState)
-        timeVec = np.zeros(MAX_OUTPUT_LENGTH,1)
-        stateTen = np.zeros(MAX_OUTPUT_LENGTH,numStates)
-        timeVec[0] = tspan[0]
+        initialState = np.copy(x).astype(np.float32)
+        numStates = np.size(initialState)
+        timeVec = np.zeros((MAX_OUTPUT_LENGTH,1),dtype=np.float32)
+        stateTen = np.zeros((MAX_OUTPUT_LENGTH,numStates),dtype=np.float32)
+        timeVec[0,0] = tspan[0]
         stateTen[0,:] = initialState
         rxnCount = 0
+        
+        @numba.njit
+        def __action(a,rxnCount,timeVec,stateTen):
+            a0 = np.sum(a)
+            r = np.random.rand(1,2)
+            tau = np.divide(-np.log(r[0,0]), a0)
+
+            A = np.copy(a).astype(np.float32)
+            mu = 0
+            s = A[0]
+            r0 = r[0,1] * a0
+            while s < r0:
+                mu += 1
+                s += A[mu]
+
+            timeVec[rxnCount+1,0] = np.add(timeVec[rxnCount,0],tau)
+            stateTen[rxnCount+1,:] = np.add(stateTen[rxnCount,:],reactionMatrix[mu,:])
+            
+            return timeVec, stateTen
         
         # MAIN LOOP
         while timeVec[rxnCount] < tspan[1]:
             # calculate propensity function
-            a = propensityFunction(stateTen[rxnCount,:])
+            a = propensityFunction(stateTen[rxnCount,:],**propensityKwargs)
+            timeVec, stateTen = __action(a,rxnCount,timeVec,stateTen)
             
+            if rxnCount + 1 > MAX_OUTPUT_LENGTH:
+                timeVec = timeVec[:rxnCount,0]
+                stateTen = stateTen[:rxnCount,:]
+                warnings.warn('Number of reaction events exceeded the number pre-allocated. Simulation is terminated')
+                return [timeVec, stateTen]
+            
+            """
             a0 = sum(a)
+            assert a0 > 0
             r = np.random.rand(1,2)
             tau = -np.log(r[0,0]) / a0
 
@@ -168,48 +224,46 @@ class Simulation():
                 warnings.warn('Number of reaction events exceeded the number pre-allocated. Simulation is terminated')
                 return timeVec, stateTen
 
-            timeVec[rxnCount+1,1] = timeVec[rxnCount,1] + tau
+            timeVec[rxnCount+1,0] = timeVec[rxnCount,0] + tau
             stateTen[rxnCount+1,:] = stateTen[rxnCount,:] + reactionMatrix[mu,:]
+            """
             rxnCount += 1
         
         # remove padding
-        timeVec = timeVec[:rxnCount+1,1]
-        stateTen = stateTen[:rxnCount+1,:]
-        assert stateTen.shape == (rxnCount+1,numStates)
-        assert timeVec.shape == (rxnCount+1,1) 
+        returnTimeVec = timeVec[:rxnCount+1,0]
+        returnStateTen = stateTen[:rxnCount+1,:]
+        assert returnStateTen.shape == (rxnCount+1,numStates)
+        assert returnTimeVec.shape == (rxnCount+1,)
         
-        if timeVec[-1] > tspan[1]:
-            timeVec = timeVec[:-1]
-            stateTen = stateTen[:-1,:]
+        if returnTimeVec[-1] > tspan[1]:
+            returnTimeVec = returnTimeVec[:-1]
+            returnStateTen = stateTen[:-1,:]
         
-        return [timeVec, stateTen]
+        return [returnTimeVec, returnStateTen]
     
     @staticmethod
-    @numba.njit
-    def _timeaverage(results,
-                     tspan,
-                     numStates):
-        """
-        """
-        timeEvolve = np.linspace(tspan[0],tspan[1]-1,tspan[1])
-        state = np.zeros((tspan[1],numStates),dtpye=np.float32)
+    def _timeaverage(t,
+                     x,
+                     Bins,
+                     timeEvolve,
+                     state,
+                     rep):
 
-        for result in results:
-            T = result[0]
-            X = result[1]
+        for i in range(rep):
+            T = np.copy(t[i]).astype(np.float32)
+            X = np.copy(x[i]).astype(np.float32)
         
-            binnedT = np.bincount(T)
-            timeEvolve += binnedT
+            binnedT, _ = np.histogram(T,bins=Bins)
+            timeEvolve = np.add(binnedT,timeEvolve)
             ind = 0
+            binnedT = np.copy(binnedT).astype(np.int64)
             
-            for i in range(tspan[1]):
-                for j in range(binnedT[i]):
-                    state[i,:] += X[j+ind,:]
-                ind += binnedT[i]
+            for st in Bins:
+                for j in range(binnedT[st]):
+                    state[st] += X[j+ind]
+                ind += binnedT[st]
             
-            assert ind == len(T)-1
-            
-        state /= len(results)
+        state = np.divide(state,rep)
             
         return timeEvolve, state
     
@@ -220,7 +274,6 @@ class Simulation():
             tspan = [0,2500],
             nproc = 4,
             MAX_OUTPUT_LENGTH = 1000000,
-            restart = False
             ):
         """Running Gilespie simulation
 
@@ -235,7 +288,7 @@ class Simulation():
         self.numReaction = self.reactionMatrix.shape[0]
         
         # assertions and warnings
-        assert len(self.state[0,:]) == self.numStates
+        assert np.size(self.state[0,:]) == self.numStates
         assert self.numStates == self.reactionMatrix.shape[1]
         
         if not (type(tspan[0]) == int and type(tspan[1]) ==int):
@@ -243,26 +296,37 @@ class Simulation():
             self.tspan[0] = int(tspan[0])
             self.tspan[1] = int(tspan[1])
         
-        if (not restart) and (self.state.shape == (self.numStates,)):
+        if (self.state.shape != (1,self.numStates)):
             raise ValueError('state must be initialized if not restarting the simulation!')
+        
         try:
-            temp = self.propensityFunction(self.state[0,:])
+            temp = propensityFunction__(self.state,**propensityKwargs__)
             assert len(temp) == self.numReaction
         except:
             raise ValueError('propensity function is malfunctioning')
         
         ## multithreading
-        #values = [filenames[i::n] for i in range(n)]]
-        initialState = self.state[-1,:]
-        inValues = [np.concatenate([initialState for j in range(rep)])]
-        assert len(inValues) == rep
-        assert len(inValues[0]) == self.numStates
+        initialState = self.state
+        assert (initialState==self.state).all()
+        inValues = list()
+        for j in range(rep):
+            inValues.append(initialState)
+        assert (inValues[0] == initialState).all()
+        assert np.size(inValues[0]) == self.numStates
         
-        init(self.propensityFunction,self.reactionMatrix,self.tspan,MAX_OUTPUT_LENGTH)
-        if __name__=="__main__":
-            with closing(mp.Pool(processes=nproc)) as p:
+        argsets = [propensityFunction__,self.reactionMatrix,self.tspan,MAX_OUTPUT_LENGTH,propensityKwargs__]
+        if nproc > 1:
+            with closing(mp.Pool(processes=nproc, initializer=init, initargs=argsets)) as p:
                 results = p.map(self._iterator,inValues)
-            assert len(results)==rep and type(results[0])==list
+        else:
+            init(*argsets)
+            results = list()
+            proceed = 1
+            for value in inValues:
+                results.append(self._iterator(value))
+                print(f'Simulation proceeding--------({proceed}/{rep})-')
+                proceed+=1
+        assert len(results)==rep
         
         ## steadystate
         if not runType.lower() in ['steadystate','timeevolution']:
@@ -270,21 +334,15 @@ class Simulation():
             runType = 'steadystate'
         
         if runType.lower() == 'steadystate':
-            self.state = np.concatenate([result[1][-1,:].reshape(1,self.numStates) for result in results], axis=0)
+            R = list()
+            for result in results:
+                R.append(result[1][-1,:].reshape(1,self.numStates))
+            self.state = np.concatenate(R,axis=0)
         elif runType.lower() == 'timeevolution':
-            self.timeEvolve, self.state = self._timeaverage(results,self.tspan,self.numStates)
-            
-            
-            
-    
-                
-                
-                
-            
-        
-        
-        
-        
-        
-
-    
+            Bins = np.linspace(self.tspan[0],self.tspan[1]-1,self.tspan[1]+1,dtype=np.int64)
+            results = np.array(results,dtype=np.ndarray)
+            timeEvolve = np.zeros(self.tspan[1],dtype=np.float32)
+            state = np.zeros((self.tspan[1],self.numStates),dtype=np.float32)
+            t = np.array(results[:,0],dtype=np.ndarray)
+            x = np.array(results[:,1],dtype=np.ndarray)
+            self.timeEvolve, self.state = self._timeaverage(t,x,Bins,timeEvolve,state,rep)
