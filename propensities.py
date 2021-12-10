@@ -34,7 +34,7 @@ def loopModifyingPropensity(x,**kwargs):
     knuc = kwargs.get("knuc",1)
     cenIndex = kwargs.get("cen",0)
     N = np.size(x)
-    x.flag.writeable = False
+    x.flags.writeable = False
     
     ## modification from bound modifier
     @numba.njit
@@ -54,7 +54,7 @@ def loopModifyingPropensity(x,**kwargs):
         k = np.zeros((length,1))
         
         for j in range(length):
-            dis = np.abs(np.subtract(site - j))
+            dis = np.abs(site - j)
             keff = (contactProb(dis*nb)/c0)*(Km + c0)/(Km + contactProb(dis*nb))
             if dis > 0:
                 if alpha:
@@ -68,10 +68,10 @@ def loopModifyingPropensity(x,**kwargs):
     def _action(x,kdecay,K,km1,alpha,knuc,cenIndex,N):
         X = np.copy(x).astype(np.float32).reshape(1,N)
         Y = np.copy(x).astype(np.float32).reshape(1,N)
-        assert not id(X)==id(Y) and not id(X[0])==id(Y[0])
         propBool = np.zeros((N,1))
         k = np.zeros((N,1))
-        decayBool = np.transpose(Y)
+        decayBool = np.transpose(Y).reshape(N,1)    # does not convert id?
+        assert not id(X)==id(decayBool)
         if knuc == 1:
             decayBool[cenIndex,0] = 0     
 
@@ -84,6 +84,13 @@ def loopModifyingPropensity(x,**kwargs):
                 if alpha and (i != cenIndex):
                     k += km1*alpha*_modification(N,i,alpha)
         
+        assert k.shape == (N,1) == propBool.shape
+        """
+        print(x,X)
+        print(k)
+        print(propBool)
+        print(decayBool)
+        """
         return np.concatenate([k*propBool,kdecay*decayBool],axis=0) 
     
     ## propensity matrix

@@ -166,12 +166,11 @@ class Simulation():
         MAX_OUTPUT_LENGTH = MAX_OUTPUT_LENGTH__
         
         ## running simulation
-        initialState = np.copy(x).astype(np.float32)
+        initialState = np.copy(x).astype(np.float32).reshape(1,np.size(x))
         numStates = np.size(initialState)
         timeVec = np.zeros((MAX_OUTPUT_LENGTH,1),dtype=np.float32)
-        stateTen = np.zeros((MAX_OUTPUT_LENGTH,numStates),dtype=np.float32)
+        stateTen = np.concatenate([initialState,np.zeros((MAX_OUTPUT_LENGTH-1,numStates),dtype=np.float32)],axis=0)
         timeVec[0,0] = tspan[0]
-        stateTen[0,:] = initialState
         rxnCount = 0
         
         @numba.njit
@@ -190,78 +189,52 @@ class Simulation():
 
             timeVec[rxnCount+1,0] = np.add(timeVec[rxnCount,0],tau)
             stateTen[rxnCount+1,:] = np.add(stateTen[rxnCount,:],reactionMatrix[mu,:])
-            
-            return timeVec, stateTen
         
         # MAIN LOOP
         while timeVec[rxnCount] < tspan[1]:
             # calculate propensity function
             a = propensityFunction(stateTen[rxnCount,:],**propensityKwargs)
-            timeVec, stateTen = __action(a,rxnCount,timeVec,stateTen)
+            __action(a,rxnCount,timeVec,stateTen)
             
             if rxnCount + 1 > MAX_OUTPUT_LENGTH:
                 timeVec = timeVec[:rxnCount,0]
                 stateTen = stateTen[:rxnCount,:]
                 warnings.warn('Number of reaction events exceeded the number pre-allocated. Simulation is terminated')
                 return [timeVec, stateTen]
-            
-            """
-            a0 = sum(a)
-            assert a0 > 0
-            r = np.random.rand(1,2)
-            tau = -np.log(r[0,0]) / a0
-
-            mu = 0
-            s = a[0]
-            r0 = r[0,1] * a0
-            while s < r0:
-                mu += 1
-                s += a[mu]
-            
-            if rxnCount + 1 > MAX_OUTPUT_LENGTH:
-                timeVec = timeVec[:rxnCount,1]
-                stateTen = stateTen[:rxnCount,:]
-                warnings.warn('Number of reaction events exceeded the number pre-allocated. Simulation is terminated')
-                return timeVec, stateTen
-
-            timeVec[rxnCount+1,0] = timeVec[rxnCount,0] + tau
-            stateTen[rxnCount+1,:] = stateTen[rxnCount,:] + reactionMatrix[mu,:]
-            """
             rxnCount += 1
         
         # remove padding
-        returnTimeVec = timeVec[:rxnCount+1,0]
-        returnStateTen = stateTen[:rxnCount+1,:]
-        assert returnStateTen.shape == (rxnCount+1,numStates)
-        assert returnTimeVec.shape == (rxnCount+1,)
+        if timeVec[rxnCount,0] > tspan[1]:
+            timeVec[rxnCount,0] = tspan[1]
+            stateTen[rxnCount,:] = np.zeros(numStates).reshape(1,numStates)
         
-        if returnTimeVec[-1] > tspan[1]:
-            returnTimeVec = returnTimeVec[:-1]
-            returnStateTen = stateTen[:-1,:]
-        
-        return [returnTimeVec, returnStateTen]
+        return [timeVec[:rxnCount+1,0], stateTen[:rxnCount+1,:]]
     
     @staticmethod
-    def _timeaverage(t,
-                     x,
-                     Bins,
-                     timeEvolve,
-                     state,
+    def _timeaverage(t,     # np.ndarray in py.array
+                     x,     # np.ndarray in py.array
+                     Bins,  # np.ndarray
+                     timeEvolve,    #np.ndarray
+                     state, # np.ndarray, 2D, float32
                      rep):
 
-        for i in range(rep):
-            T = np.copy(t[i]).astype(np.float32)
-            X = np.copy(x[i]).astype(np.float32)
-        
+        @numba.njit
+        def __action(T,X,Bins,timeEvolve,state):
             binnedT, _ = np.histogram(T,bins=Bins)
-            timeEvolve = np.add(binnedT,timeEvolve)
+            timeEvolve = np.add(binnedT, timeEvolve)
             ind = 0
             binnedT = np.copy(binnedT).astype(np.int64)
             
-            for st in Bins:
+            for st in Bins[:-1]:
                 for j in range(binnedT[st]):
                     state[st] += X[j+ind]
+                if binnedT[st]: state[st] /= binnedT[st]
                 ind += binnedT[st]
+                
+        for i in range(rep):
+            T = np.copy(t[i]).astype(np.float32)
+            X = np.copy(x[i]).astype(np.float32)
+            __action(T,X,Bins,timeEvolve,state)           
             
         state = np.divide(state,rep)
             
@@ -318,6 +291,7 @@ class Simulation():
         if nproc > 1:
             with closing(mp.Pool(processes=nproc, initializer=init, initargs=argsets)) as p:
                 results = p.map(self._iterator,inValues)
+            #print(results[-1][0])
         else:
             init(*argsets)
             results = list()
@@ -326,7 +300,15 @@ class Simulation():
                 results.append(self._iterator(value))
                 print(f'Simulation proceeding--------({proceed}/{rep})-')
                 proceed+=1
+               # print(results[-1][0])
+        time.sleep(0.5)
         assert len(results)==rep
+        
+        t = list()
+        x = list()
+        for i in range(rep):
+            t.append(results[i][0])
+            x.append(results[i][1])
         
         ## steadystate
         if not runType.lower() in ['steadystate','timeevolution']:
@@ -334,15 +316,16 @@ class Simulation():
             runType = 'steadystate'
         
         if runType.lower() == 'steadystate':
-            R = list()
-            for result in results:
-                R.append(result[1][-1,:].reshape(1,self.numStates))
-            self.state = np.concatenate(R,axis=0)
+            #results = np.array(results,dtype=np.ndarray)
+            self.state = np.concatenate([(1/10)*xx[-10:,:].sum(0) for xx in x],axis=0).reshape(rep,self.numStates)
+            
         elif runType.lower() == 'timeevolution':
-            Bins = np.linspace(self.tspan[0],self.tspan[1]-1,self.tspan[1]+1,dtype=np.int64)
-            results = np.array(results,dtype=np.ndarray)
+            Bins = np.linspace(self.tspan[0],self.tspan[1],self.tspan[1]+1,dtype=np.int64)
+            #results = np.array(results,dtype=np.ndarray)
             timeEvolve = np.zeros(self.tspan[1],dtype=np.float32)
             state = np.zeros((self.tspan[1],self.numStates),dtype=np.float32)
-            t = np.array(results[:,0],dtype=np.ndarray)
-            x = np.array(results[:,1],dtype=np.ndarray)
+            #t = np.array(results[:,0],dtype=np.ndarray)
+            #x = np.array(results[:,1],dtype=np.ndarray)
             self.timeEvolve, self.state = self._timeaverage(t,x,Bins,timeEvolve,state,rep)
+        
+        print('_______Simulation Complete________')
