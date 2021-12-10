@@ -206,7 +206,7 @@ class Simulation():
         # remove padding
         if timeVec[rxnCount,0] > tspan[1]:
             timeVec[rxnCount,0] = tspan[1]
-            stateTen[rxnCount,:] = np.zeros(numStates).reshape(1,numStates)
+            #stateTen[rxnCount,:] = np.zeros(numStates).reshape(1,numStates)
         
         return [timeVec[:rxnCount+1,0], stateTen[:rxnCount+1,:]]
     
